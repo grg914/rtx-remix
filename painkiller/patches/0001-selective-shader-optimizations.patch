@@ -1,0 +1,133 @@
+diff --git a/src/dxvk/shaders/rtx/concept/light/light_shaping.slangh b/src/dxvk/shaders/rtx/concept/light/light_shaping.slangh
+--- a/src/dxvk/shaders/rtx/concept/light/light_shaping.slangh
++++ b/src/dxvk/shaders/rtx/concept/light/light_shaping.slangh
+@@ -95,13 +95,14 @@ float lightShapingCalcScaledRadialFalloff(LightShaping lightShaping, vec3 lightT
+   }
+ 
+   const float softenedIntensity = smoothstep(scaledConeAngle, scaledConeAngle + lightShaping.coneSoftness, cosTheta);
+-  const float focusedIntensity = pow(cosTheta, lightShaping.focusExponent * ratio);
+ 
+   if (lightShaping.focusExponent <= 0.0f)
+   {
+     return softenedIntensity;
+   }
+ 
++  const float focusedIntensity = pow(cosTheta, lightShaping.focusExponent * ratio);
++
+   return mix(softenedIntensity, 1.0f, focusedIntensity * softenedIntensity);
+ }
+ 
+diff --git a/src/dxvk/shaders/rtx/pass/composite/composite_alpha_blend.comp.slang b/src/dxvk/shaders/rtx/pass/composite/composite_alpha_blend.comp.slang
+--- a/src/dxvk/shaders/rtx/pass/composite/composite_alpha_blend.comp.slang
++++ b/src/dxvk/shaders/rtx/pass/composite/composite_alpha_blend.comp.slang
+@@ -178,8 +178,11 @@ void main(uint2 thread_id : SV_DispatchThreadID, uint2 localIndex : SV_GroupThre
+             bool isSameGeometry = true;
+             if (cb.stochasticAlphaBlendSearchTheSameObject)
+             {
+-              uint16_t neighborGeometryHash = AlphaBlendSurface.createFromPacked(AlphaBlendGBuffer[neighborPixel], cb.alphaBlendSurfacePackMult).geometryHash;
+-              isSameGeometry = (i == 0) || surface.geometryHash == neighborGeometryHash;
++              if (i != 0)
++              {
++                uint16_t neighborGeometryHash = AlphaBlendSurface.createFromPacked(AlphaBlendGBuffer[neighborPixel], cb.alphaBlendSurfacePackMult).geometryHash;
++                isSameGeometry = surface.geometryHash == neighborGeometryHash;
++              }
+             }
+             if (!isMiss && (isCoplanar || isDepthSimilar) && isNormalSimilar && isSameGeometry)
+             {
+@@ -210,14 +213,17 @@ void main(uint2 thread_id : SV_DispatchThreadID, uint2 localIndex : SV_GroupThre
+           vec2 offset = vec2(getNextSampleBlueNoise(randomState), getNextSampleBlueNoise(randomState)) * 2 - 1;
+ 
+           uint neighborResult = -1;
+-          for (int i = 0; i < 4; ++i)
++          if (cb.stochasticAlphaBlendShareNeighbors)
+           {
+-            int2 idx = int2(i&1, i>>1) * 2 - 1;
+-            int2 neighborLocalIndex = clamp(localIndex, 1, int2(16 ,8) - 2) + idx;
+-            neighborResult = samplePixel[neighborLocalIndex.y * 16 + neighborLocalIndex.x];
+-            if (neighborResult != -1)
++            for (int i = 0; i < 4; ++i)
+             {
+-              break;
++              int2 idx = int2(i&1, i>>1) * 2 - 1;
++              int2 neighborLocalIndex = clamp(localIndex, 1, int2(16 ,8) - 2) + idx;
++              neighborResult = samplePixel[neighborLocalIndex.y * 16 + neighborLocalIndex.x];
++              if (neighborResult != -1)
++              {
++                break;
++              }
+             }
+           }
+ 
+diff --git a/src/dxvk/shaders/rtx/pass/ray_reconstruction/prepare_ray_reconstruction.comp.slang b/src/dxvk/shaders/rtx/pass/ray_reconstruction/prepare_ray_reconstruction.comp.slang
+--- a/src/dxvk/shaders/rtx/pass/ray_reconstruction/prepare_ray_reconstruction.comp.slang
++++ b/src/dxvk/shaders/rtx/pass/ray_reconstruction/prepare_ray_reconstruction.comp.slang
+@@ -261,17 +261,17 @@ void preprocessInputsForRR(uint2 pixelCoordinate)
+     vec4 primaryAlbedo          = PrimaryAlbedo[pixelCoordinate] * primaryAttenuation;
+     vec4 primarySpecularAlbedo  = PrimarySpecularAlbedo[pixelCoordinate] * primaryAttenuation;
+ 
+-    vec4 secondaryAlbedo         = vec4(SecondaryAlbedo[pixelCoordinate].xyz, 0.0) * secondaryAttenuation;
+-    vec4 secondarySpecularAlbedo = vec4(SecondarySpecularAlbedo[pixelCoordinate].xyz, 0.0) * secondaryAttenuation;
+-
+     const float primaryPerceptualRoughness = PrimaryVirtualWorldNormalPerceptualRoughness[pixelCoordinate].w;
+-    const float secondaryPerceptualRoughness = SecondaryVirtualWorldNormalPerceptualRoughness[pixelCoordinate].w;
+ 
+     primarySpecularAlbedo *= getRoughnessFactor(primaryPerceptualRoughness);
+ 
+     // Combine secondary albedo to improve reflection quality.
+     if (hasSecondarySurface)
+     {
++      const vec4 secondaryAlbedo         = vec4(SecondaryAlbedo[pixelCoordinate].xyz, 0.0) * secondaryAttenuation;
++      const vec4 secondarySpecularAlbedo = vec4(SecondarySpecularAlbedo[pixelCoordinate].xyz, 0.0) * secondaryAttenuation;
++      const float secondaryPerceptualRoughness = SecondaryVirtualWorldNormalPerceptualRoughness[pixelCoordinate].w;
++
+       primaryAlbedo += secondaryAlbedo;
+       primarySpecularAlbedo += secondarySpecularAlbedo * getRoughnessFactor(secondaryPerceptualRoughness);
+     }
+diff --git a/src/dxvk/shaders/rtx/pass/skinning.h b/src/dxvk/shaders/rtx/pass/skinning.h
+--- a/src/dxvk/shaders/rtx/pass/skinning.h
++++ b/src/dxvk/shaders/rtx/pass/skinning.h
+@@ -67,10 +67,8 @@ void skinning(const uint32_t idx,
+   const uint32_t baseWeightsOffset = (cb.blendWeightOffset + idx * cb.blendWeightStride) / 4;
+ 
+   // Weights are normalized to 1, the last weight is equal to the remainder
++  // The remainder is accumulated in the bone loops below, as each weight is read.
+   float lastWeight = 1.f;
+-  for (uint i = 0; i < cb.numBones - 1; i++) {
+-    lastWeight -= srcBlendWeight[baseWeightsOffset + i];
+-  }
+ 
+   // Read position
+   const uint baseSrcPositionOffset = (cb.srcPositionOffset + idx * cb.srcPositionStride) / 4;
+@@ -100,7 +98,11 @@ void skinning(const uint32_t idx,
+     for (uint j = 0; j < cb.numBones; j+=4) {
+       uint4 blendIndices = get(srcBlendIndices, baseIndicesOffset + j);
+       for (uint i = 0; i < 4 && i + j < cb.numBones; ++i) {
+-        float blendWeight = i + j == cb.numBones - 1 ? lastWeight : srcBlendWeight[baseWeightsOffset + i + j];
++        float blendWeight = lastWeight;
++        if (i + j != cb.numBones - 1) {
++          blendWeight = srcBlendWeight[baseWeightsOffset + i + j];
++          lastWeight -= blendWeight;
++        }
+         if (blendWeight > 0) {
+           Matrix4 bone = toMatrix4(cb.bones[blendIndices[i]]);
+           positionOut += mul(bone, position) * blendWeight;
+@@ -111,6 +113,7 @@ void skinning(const uint32_t idx,
+   } else {
+     for (uint i = 0; i < cb.numBones - 1; ++i) {
+       float blendWeight = srcBlendWeight[baseWeightsOffset + i];
++      lastWeight -= blendWeight;
+       if (blendWeight > 0.f) {
+         Matrix4 bone = toMatrix4(cb.bones[i]);
+         positionOut += mul(bone, position) * blendWeight;
+diff --git a/src/dxvk/shaders/rtx/utility/texture.slangh b/src/dxvk/shaders/rtx/utility/texture.slangh
+--- a/src/dxvk/shaders/rtx/utility/texture.slangh
++++ b/src/dxvk/shaders/rtx/utility/texture.slangh
+@@ -25,7 +25,7 @@
+ 
+ vec4 textureRead(uint16_t textureIndex, uint16_t samplerIndex, SurfaceInteraction surfaceInteraction, float lodBias = 0.0)
+ {
+-  const float gradBias = pow(2, lodBias);
++  const float gradBias = exp2(lodBias);
+ 
+   // Note: The nonuniform decoration on the texture index here and returned Sampler2D does not propagate through function calls due to a rather
+   // annoying exception in the specification (See: https://github.com/KhronosGroup/GLSL/blob/master/extensions/ext/GL_EXT_nonuniform_qualifier.txt).
